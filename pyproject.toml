@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 python = ">=3.9, <3.14"
 frida = "^16.1"
 unicorn = "^1.0"
-lief = "^0.14"
+lief = "0.13.2"
 fire = "^0.4"
 capstone = "^4.0"
 xxhash = "^2.0"
@@ -20,7 +20,7 @@ mypy = "^0.910"
 pylint = "^2.11"
 yapf = "^0.32.0"
 toml = "^0.10.2"
-pyinstaller = "^5.13"
+pyinstaller = { version = "^5.13", python = "<3.13" }
 
 [tool.poetry.scripts]
 unlicense = 'unlicense.application:main'

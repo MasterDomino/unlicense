@@ -5,7 +5,9 @@ from typing import Dict, Tuple, Any, Optional
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
 
-from .imports import ImportToCallSiteDict, WrapperSet, find_wrapped_imports
+from .imports import (ImportToCallSiteDict, WrapperSet, DataCellDict,
+                      DataCellWrapperSet, find_wrapped_imports,
+                      find_stale_data_pointers)
 from .dump_utils import dump_pe, pointer_size_to_fmt
 from .emulation import resolve_wrapped_api
 from .function_hashing import compute_function_hash, EMPTY_FUNCTION_HASH
@@ -61,11 +63,35 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                      process_controller)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
-    iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
-                                                      text_section_range.base,
-                                                      process_controller)
-    LOG.info("Generated the fake IAT at %s, size=%s", hex(iat_addr),
-             hex(iat_size))
+    # Look for raw pointer-table cells (not call/jmp instructions) holding a
+    # live-only, process-instance-specific export address -- e.g. a packer's
+    # own resolved-wrapper cache walked as plain data by CRT startup code
+    # (`_initterm`/`_initterm_e` iterating C++ static-initializer arrays).
+    # These are invisible to `find_wrapped_imports` (it only looks for
+    # call/jmp instruction bytes) and, left untouched, keep the ORIGINAL
+    # run's ASLR-randomized absolute pointer baked into the dump -- which
+    # crashes on every subsequent run once the exporting DLL gets a new base.
+    LOG.info("Looking for stale data-cell pointers ...")
+    data_cell_apis, data_cell_wrappers = find_stale_data_pointers(
+        text_section_range, exports_dict, process_controller)
+    LOG.info("Potential stale data cells found: %d",
+             sum(len(v) for v in data_cell_apis.values()) +
+             len(data_cell_wrappers))
+    _resolve_data_cell_wrappers(data_cell_apis, data_cell_wrappers,
+                                process_controller)
+    LOG.info("Data-cell APIs resolved: %d", len(data_cell_apis))
+
+    # Ensure every data-cell API also gets a fake IAT slot, even if it has no
+    # .text call/jmp site of its own.
+    for api_addr in data_cell_apis:
+        if api_addr not in api_to_calls:
+            api_to_calls[api_addr] = []
+
+    iat_addr, iat_size = _generate_new_iat_and_trampolines_in_process(
+        api_to_calls, data_cell_apis, text_section_range.base,
+        process_controller)
+    LOG.info("Generated the fake IAT (+trampolines) at %s, size=%s",
+             hex(iat_addr), hex(iat_size))
 
     # Ensure the range is writable
     process_controller.set_memory_protection(text_section_range.base,
@@ -194,29 +220,101 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
             problematic_wrappers.add(wrapper_addr)
 
 
-def _generate_new_iat_in_process(
-        imports_dict: ImportToCallSiteDict, near_to_ptr: int,
+def _resolve_data_cell_wrappers(
+        data_cell_apis: DataCellDict, data_cell_wrappers: DataCellWrapperSet,
+        process_controller: ProcessController) -> None:
+    """
+    Resolve data cells whose value points to an unresolved wrapper stub
+    (rather than directly to a named export) by emulating the stub, mirroring
+    the wrapper-resolution branch of `_resolve_imports`. There's no call site
+    to return to here (the value is read as plain data, not executed from a
+    known instruction), so emulation runs with no expected return address.
+    """
+    resolved_wrappers: Dict[int, int] = {}
+    for cell_addr, wrapper_addr in data_cell_wrappers:
+        resolved_addr = resolved_wrappers.get(wrapper_addr)
+        if resolved_addr is None:
+            resolved_addr = resolve_wrapped_api(wrapper_addr,
+                                                process_controller)
+            if resolved_addr is None:
+                continue
+            resolved_wrappers[wrapper_addr] = resolved_addr
+        data_cell_apis[resolved_addr].append(cell_addr)
+
+
+def _generate_new_iat_and_trampolines_in_process(
+        imports_dict: ImportToCallSiteDict, data_cell_apis: DataCellDict,
+        near_to_ptr: int,
         process_controller: ProcessController) -> Tuple[int, int]:
     """
-    Generate a new IAT from a list of imported function addresses and write
-    it into a new buffer into the target process. `near_to_ptr` is used to
-    allocate the new IAT near the unpacked module (which is needed for 64-bit
-    processes).
+    Generate a new IAT from a list of imported function addresses, plus one
+    `jmp qword [iat_slot]` trampoline per API that's referenced from a raw
+    data cell (see `find_stale_data_pointers`), and patch each such cell to
+    point at its trampoline instead of the original live-only absolute
+    address. `near_to_ptr` is used to allocate the buffer near the unpacked
+    module (needed for 64-bit RIP-relative displacements).
+
+    A data cell holds a raw pointer VALUE, not a call/jmp instruction with an
+    operand -- it can't be rewritten in place the way `.text` call sites are
+    (that's what `_fix_import_references_in_process` does). Instead, each
+    such cell is redirected to a tiny synthesized thunk that re-reads the
+    resolved address from the (freshly rebuilt, correctly relocated at
+    runtime) fake IAT on every call, so it stays valid across ASLR-randomized
+    runs instead of freezing one process instance's live address.
     """
     ptr_size = process_controller.pointer_size
     ptr_format = pointer_size_to_fmt(ptr_size)
     iat_size = len(imports_dict) * ptr_size
-    # Allocate a new buffer in the target process
+    # One 6-byte `FF25 disp32` thunk per API actually referenced by a data
+    # cell (shared across every cell holding that same API's address).
+    trampoline_targets = [addr for addr in data_cell_apis if data_cell_apis[addr]]
+    trampoline_size = len(trampoline_targets) * 6
+    total_size = iat_size + trampoline_size
+
+    # Single allocation so the IAT and its trampolines land in one region
+    # (guaranteed nearby for the RIP-relative math, and guaranteed to be
+    # captured together by the dump/fix-IAT step via the returned size).
     iat_addr = process_controller.allocate_process_memory(
-        iat_size, near_to_ptr)
+        total_size, near_to_ptr)
 
     # Generate the new IAT and write it into the buffer
     new_iat_data = bytearray()
-    for import_addr in imports_dict:
+    slot_index: Dict[int, int] = {}
+    for i, import_addr in enumerate(imports_dict):
+        slot_index[import_addr] = i
         new_iat_data += struct.pack(ptr_format, import_addr)
     process_controller.write_process_memory(iat_addr, list(new_iat_data))
 
-    return iat_addr, iat_size
+    # Generate one trampoline per referenced API and repoint its data cells
+    arch = process_controller.architecture
+    trampoline_base = iat_addr + iat_size
+    for j, api_addr in enumerate(trampoline_targets):
+        trampoline_addr = trampoline_base + j * 6
+        iat_slot_addr = iat_addr + slot_index[api_addr] * ptr_size
+        if arch == Architecture.X86_32:
+            # `FF25 disp32` on x86 addresses an absolute location, not
+            # PC-relative -- no subtraction, unlike the x64 RIP-relative form.
+            operand = iat_slot_addr
+            fmt = "<I"
+        elif arch == Architecture.X86_64:
+            operand = iat_slot_addr - (trampoline_addr + 6)
+            fmt = "<i"
+        else:
+            raise NotImplementedError(f"Unsupported architecture: {arch}")
+        thunk = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
+        process_controller.write_process_memory(trampoline_addr, list(thunk))
+
+        cell_bytes = list(struct.pack(ptr_format, trampoline_addr))
+        for cell_addr in data_cell_apis[api_addr]:
+            process_controller.write_process_memory(cell_addr, cell_bytes)
+
+    if trampoline_size > 0:
+        # The IAT slots only need to be read; the trampolines need to be
+        # executed. r-x covers both (data reads are permitted from
+        # executable pages).
+        process_controller.set_memory_protection(iat_addr, total_size, "r-x")
+
+    return iat_addr, total_size
 
 
 def _fix_import_references_in_process(
