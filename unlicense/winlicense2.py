@@ -7,7 +7,7 @@ from capstone import (  # type: ignore
 
 from .imports import (ImportToCallSiteDict, WrapperSet, DataCellDict,
                       DataCellWrapperSet, find_wrapped_imports,
-                      find_stale_data_pointers)
+                      find_stale_data_pointers, enumerate_executable_ranges)
 from .dump_utils import dump_pe, pointer_size_to_fmt
 from .emulation import resolve_wrapped_api
 from .function_hashing import compute_function_hash, EMPTY_FUNCTION_HASH
@@ -72,8 +72,10 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     # run's ASLR-randomized absolute pointer baked into the dump -- which
     # crashes on every subsequent run once the exporting DLL gets a new base.
     LOG.info("Looking for stale data-cell pointers ...")
+    executable_ranges = enumerate_executable_ranges(process_controller)
     data_cell_apis, data_cell_wrappers = find_stale_data_pointers(
-        text_section_range, exports_dict, process_controller)
+        text_section_range, exports_dict, executable_ranges,
+        process_controller.pointer_size)
     LOG.info("Potential stale data cells found: %d",
              sum(len(v) for v in data_cell_apis.values()) +
              len(data_cell_wrappers))

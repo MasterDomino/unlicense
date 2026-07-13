@@ -1,3 +1,4 @@
+import bisect
 import logging
 import struct
 from collections import defaultdict
@@ -133,10 +134,61 @@ def find_wrapped_imports(
     return api_to_calls, wrapper_set
 
 
+def enumerate_executable_ranges(
+        process_controller: ProcessController) -> List[MemoryRange]:
+    """
+    Fetch every executable memory range across all loaded modules in ONE bulk
+    pass (a handful of RPC calls -- one per loaded module). Meant to be
+    fetched once and reused for any number of local containment checks
+    afterwards, instead of querying per-address via `find_range_by_address`
+    (a fresh RPC round-trip every time), which is fine for the low call
+    volume in `find_wrapped_imports` (gated by a narrow instruction-shape
+    pre-filter) but would be ruinously slow for `find_stale_data_pointers`
+    (which has no such pre-filter and checks every pointer-sized cell in the
+    section -- millions of candidates, meaning millions of RPC round-trips
+    if done one at a time).
+    """
+    ranges: List[MemoryRange] = []
+    for module_name in process_controller.enumerate_modules():
+        ranges += process_controller.enumerate_module_ranges(
+            module_name, include_data=False)
+    return [r for r in ranges if r.protection[2] == 'x']
+
+
+# Sorted (non-overlapping) range bounds for O(log n) local containment
+# checks: (sorted range-start addresses, matching range-end addresses)
+SortedRanges = Tuple[List[int], List[int]]
+
+
+def _sort_ranges(ranges: List[MemoryRange]) -> SortedRanges:
+    """
+    Precompute a sorted view of a range list for fast repeated containment
+    checks. OS-reported memory ranges don't overlap, so bisecting on the
+    start address alone is sufficient to find the one candidate range that
+    could contain a given address.
+    """
+    ordered = sorted(ranges, key=lambda r: r.base)
+    return [r.base for r in ordered], [r.base + r.size for r in ordered]
+
+
+def _sorted_ranges_contains(sorted_ranges: SortedRanges, address: int) -> bool:
+    """
+    O(log n) containment check against a pre-sorted range list -- with
+    millions of candidate addresses to check (see `find_stale_data_pointers`),
+    even a fast local linear scan over every range would add up; this keeps
+    each check to a handful of comparisons regardless of how many ranges
+    there are.
+    """
+    bases, ends = sorted_ranges
+    idx = bisect.bisect_right(bases, address) - 1
+    return idx >= 0 and address < ends[idx]
+
+
 def find_stale_data_pointers(
     text_section_range: MemoryRange,
     exports_dict: Dict[int, Dict[str, Any]],
-    process_controller: ProcessController,
+    executable_ranges: List[MemoryRange],
+    ptr_size: int,
 ) -> Tuple[DataCellDict, DataCellWrapperSet]:
     """
     Scan the section for pointer-sized, naturally-aligned data cells whose
@@ -156,9 +208,14 @@ def find_stale_data_pointers(
     process instance -- every subsequent run gets a different randomized base
     for the exporting DLL, so the frozen pointer dereferences into unmapped
     memory and crashes.
+
+    `executable_ranges` must be pre-fetched (see `enumerate_executable_ranges`)
+    -- with no instruction-shape pre-filter, this scans every pointer-sized
+    cell in the section (millions, for a large `.text`), so classifying each
+    candidate via a live RPC call would be far too slow.
     """
-    ptr_size = process_controller.pointer_size
     ptr_format = pointer_size_to_fmt(ptr_size)
+    sorted_ranges = _sort_ranges(executable_ranges)
 
     assert text_section_range.data is not None
     data = text_section_range.data
@@ -175,7 +232,7 @@ def find_stale_data_pointers(
         if not text_section_range.contains(value):
             if value in exports_dict:
                 api_to_cells[value].append(cell_addr)
-            elif _is_in_executable_range(value, process_controller):
+            elif _sorted_ranges_contains(sorted_ranges, value):
                 wrapper_cells.add((cell_addr, value))
         i += ptr_size
 
