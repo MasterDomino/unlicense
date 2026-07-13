@@ -1,6 +1,6 @@
 import logging
 import struct
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
