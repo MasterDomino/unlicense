@@ -5,7 +5,7 @@ import platform
 import shutil
 import struct
 from tempfile import TemporaryDirectory
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import lief
 import pyscylla  # type: ignore
@@ -71,6 +71,7 @@ def dump_pe(
     iat_addr: int,
     iat_size: int,
     add_new_iat: bool,
+    stale_cell_names: Optional[Dict[str, List[int]]] = None,
 ) -> bool:
     # Reclaim as much memory as possible. This is kind of a hack for 32-bit
     # interpreters not to run out of memory when dumping.
@@ -106,6 +107,17 @@ def dump_pe(
         LOG.info("Rebuilding PE ...")
         output_file_name = f"unpacked_{process_controller.main_module_name}"
         _fix_pe(TMP_FILE_PATH2, output_file_name)
+
+        # Re-point stale data-cell pointers (packer "resolved import cache"
+        # cells walked as data by CRT init code) at freshly-built trampolines.
+        # Must run on the FINAL file: it depends on where Scylla relocated the
+        # IAT, and the trampoline section is appended after everything else.
+        if stale_cell_names:
+            LOG.info("Injecting %d data-cell trampoline(s) ...",
+                     sum(len(v) for v in stale_cell_names.values()))
+            _inject_data_cell_trampolines(
+                output_file_name, image_base, stale_cell_names,
+                process_controller.pointer_size)
 
         LOG.info("Output file has been saved at '%s'", output_file_name)
 
@@ -208,6 +220,196 @@ def _get_pe_size(pe_file_path: str) -> Optional[int]:
     pe_size = highest_section.offset + highest_section.size
 
     return pe_size
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _parse_import_name_to_iat_slot(data: bytes) -> Dict[str, int]:
+    """
+    Parse a PE's import directory and return {import name -> IAT slot RVA}.
+
+    Deterministic, dependency-free (plain struct) so it doesn't rely on a
+    specific `lief` version's import-parsing API. Ordinal-only imports (no
+    name) are skipped -- the packer's data cells reference named exports.
+    """
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    magic = struct.unpack_from("<H", data, e_lfanew + 0x18)[0]
+    is_64 = magic == 0x20B
+    thunk_size = 8 if is_64 else 4
+    thunk_fmt = "<Q" if is_64 else "<I"
+    ordinal_flag = 1 << (63 if is_64 else 31)
+    # Optional header size differs 32/64; import dir is entry #1 of the data
+    # directory, which starts at a fixed offset within the optional header.
+    dd_offset = e_lfanew + 0x18 + (0x70 if is_64 else 0x60)
+    import_rva = struct.unpack_from("<I", data, dd_offset + 1 * 8)[0]
+    if import_rva == 0:
+        return {}
+
+    sections = _read_section_headers(data)
+
+    def rva_to_off(rva: int) -> Optional[int]:
+        for s in sections:
+            if s["va"] <= rva < s["va"] + max(s["vsize"], s["rawsize"]):
+                return s["rawptr"] + (rva - s["va"])
+        return None
+
+    def read_cstr(rva: int) -> str:
+        off = rva_to_off(rva)
+        if off is None:
+            return ""
+        end = data.find(b"\x00", off)
+        return data[off:end].decode("latin1") if end != -1 else ""
+
+    name_to_slot: Dict[str, int] = {}
+    desc_off = rva_to_off(import_rva)
+    if desc_off is None:
+        return {}
+    # IMAGE_IMPORT_DESCRIPTOR is 20 bytes; array terminated by an all-zero one.
+    while True:
+        orig_first_thunk, _, _, name_rva, first_thunk = struct.unpack_from(
+            "<IIIII", data, desc_off)
+        if orig_first_thunk == 0 and first_thunk == 0 and name_rva == 0:
+            break
+        # ILT (OriginalFirstThunk) holds the names; fall back to IAT if absent.
+        lookup_rva = orig_first_thunk or first_thunk
+        lookup_off = rva_to_off(lookup_rva)
+        if lookup_off is not None:
+            idx = 0
+            while True:
+                thunk = struct.unpack_from(thunk_fmt, data, lookup_off +
+                                           idx * thunk_size)[0]
+                if thunk == 0:
+                    break
+                if not thunk & ordinal_flag:
+                    # thunk = RVA to IMAGE_IMPORT_BY_NAME (2-byte hint + name)
+                    name = read_cstr((thunk & (ordinal_flag - 1)) + 2)
+                    if name:
+                        name_to_slot[name] = first_thunk + idx * thunk_size
+                idx += 1
+        desc_off += 20
+
+    return name_to_slot
+
+
+def _read_section_headers(data: bytes) -> List[Dict[str, int]]:
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    num_sections = struct.unpack_from("<H", data, e_lfanew + 0x6)[0]
+    size_opt_hdr = struct.unpack_from("<H", data, e_lfanew + 0x14)[0]
+    sec_table = e_lfanew + 0x18 + size_opt_hdr
+    sections = []
+    for i in range(num_sections):
+        off = sec_table + i * 40
+        vsize, va, rawsize, rawptr = struct.unpack_from("<IIII", data, off + 8)
+        sections.append({"off": off, "vsize": vsize, "va": va,
+                         "rawsize": rawsize, "rawptr": rawptr})
+    return sections
+
+
+def _inject_data_cell_trampolines(pe_path: str, image_base: int,
+                                  stale_cell_names: Dict[str, List[int]],
+                                  ptr_size: int) -> None:
+    """
+    Append a new executable section of `FF25` trampolines to the dumped PE and
+    re-point every stale data cell at its trampoline.
+
+    Each trampoline is `jmp qword [import_slot]` (x64: RIP-relative; x86:
+    absolute), so the packer's resolved-import-cache cells -- which CRT
+    startup calls as function pointers but which held a frozen, ASLR-dependent
+    live address -- now indirect through the Windows-loader-populated IAT and
+    stay valid across runs. Done post-dump because it depends on where Scylla
+    placed the rebuilt IAT.
+    """
+    with open(pe_path, "rb") as f:
+        data = bytearray(f.read())
+
+    is_64 = ptr_size == 8
+    ptr_fmt = "<Q" if is_64 else "<I"
+    name_to_slot = _parse_import_name_to_iat_slot(bytes(data))
+
+    # Keep only names we can actually resolve to a rebuilt IAT slot.
+    tramp_names = [n for n in stale_cell_names if n in name_to_slot]
+    missing = [n for n in stale_cell_names if n not in name_to_slot]
+    if missing:
+        LOG.warning("No IAT slot for %d data-cell import(s) (e.g. %s); "
+                    "their cells left unpatched", len(missing), missing[:5])
+    if not tramp_names:
+        return
+
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    sect_align = struct.unpack_from("<I", data, e_lfanew + 0x38)[0]
+    file_align = struct.unpack_from("<I", data, e_lfanew + 0x3C)[0]
+    num_sections = struct.unpack_from("<H", data, e_lfanew + 0x6)[0]
+    size_opt_hdr = struct.unpack_from("<H", data, e_lfanew + 0x14)[0]
+    sec_table = e_lfanew + 0x18 + size_opt_hdr
+    first_section_rawptr = min(
+        s["rawptr"] for s in _read_section_headers(bytes(data)) if s["rawptr"])
+
+    # Ensure there's room in the header for one more 40-byte section entry.
+    if sec_table + (num_sections + 1) * 40 > first_section_rawptr:
+        LOG.error("No room for a new section header; skipping trampolines")
+        return
+
+    sections = _read_section_headers(bytes(data))
+    new_va = _align_up(max(s["va"] + s["vsize"] for s in sections), sect_align)
+    new_rawptr = _align_up(len(data), file_align)
+
+    # Build trampoline bytes now that we know the section's VA.
+    tramp_bytes = bytearray()
+    name_to_tramp_va: Dict[str, int] = {}
+    for j, name in enumerate(tramp_names):
+        tramp_va = image_base + new_va + j * 6
+        name_to_tramp_va[name] = tramp_va
+        slot_va = image_base + name_to_slot[name]
+        if is_64:
+            operand = struct.pack("<i", slot_va - (tramp_va + 6))
+        else:
+            operand = struct.pack("<I", slot_va)
+        tramp_bytes += b"\xff\x25" + operand
+
+    vsize = len(tramp_bytes)
+    rawsize = _align_up(vsize, file_align)
+
+    # Re-point the data cells (patch the dumped .text in place).
+    def rva_to_off(rva: int) -> Optional[int]:
+        for s in sections:
+            if s["va"] <= rva < s["va"] + max(s["vsize"], s["rawsize"]):
+                return s["rawptr"] + (rva - s["va"])
+        return None
+
+    patched = 0
+    for name in tramp_names:
+        tramp_va = name_to_tramp_va[name]
+        for cell_va in stale_cell_names[name]:
+            off = rva_to_off(cell_va - image_base)
+            if off is None or off + ptr_size > len(data):
+                continue
+            struct.pack_into(ptr_fmt, data, off, tramp_va)
+            patched += 1
+
+    # Append the section raw data (padded to file alignment).
+    data += b"\x00" * (new_rawptr - len(data))
+    data += tramp_bytes + b"\x00" * (rawsize - vsize)
+
+    # Write the new section header (IMAGE_SECTION_HEADER, 40 bytes).
+    CNT_CODE_EXEC_READ = 0x60000020
+    header = struct.pack("<8sIIIIIIHHI", b".idata2\x00"[:8], vsize, new_va,
+                         rawsize, new_rawptr, 0, 0, 0, 0, CNT_CODE_EXEC_READ)
+    data[sec_table + num_sections * 40:
+         sec_table + num_sections * 40 + 40] = header
+
+    # Update NumberOfSections and SizeOfImage.
+    struct.pack_into("<H", data, e_lfanew + 0x6, num_sections + 1)
+    new_size_of_image = _align_up(new_va + vsize, sect_align)
+    struct.pack_into("<I", data, e_lfanew + 0x50, new_size_of_image)
+    # Invalidate the (now-stale) checksum; Windows doesn't verify it for EXEs.
+    struct.pack_into("<I", data, e_lfanew + 0x58, 0)
+
+    with open(pe_path, "wb") as f:
+        f.write(data)
+    LOG.info("Injected %d trampoline(s), re-pointed %d data cell(s)",
+             len(tramp_names), patched)
 
 
 def pointer_size_to_fmt(pointer_size: int) -> str:

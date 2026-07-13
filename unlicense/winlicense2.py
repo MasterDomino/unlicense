@@ -84,16 +84,24 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     LOG.info("Data-cell APIs resolved: %d", len(data_cell_apis))
 
     # Ensure every data-cell API also gets a fake IAT slot, even if it has no
-    # .text call/jmp site of its own.
+    # .text call/jmp site of its own -- so Scylla imports it by name and the
+    # post-dump trampolines (below) have a real IAT slot to jump through.
     for api_addr in data_cell_apis:
         if api_addr not in api_to_calls:
             api_to_calls[api_addr] = []
 
-    iat_addr, iat_size = _generate_new_iat_and_trampolines_in_process(
-        api_to_calls, data_cell_apis, text_section_range.base,
-        process_controller)
-    LOG.info("Generated the fake IAT (+trampolines) at %s, size=%s",
-             hex(iat_addr), hex(iat_size))
+    # Map each stale data cell to the *name* of the API it should call. The
+    # trampolines that re-point these cells can only be built AFTER the dump
+    # (Scylla discards anything handed to it as IAT data that isn't a valid
+    # export pointer, and it relocates the IAT to a new section), so we resolve
+    # names now and hand them to dump_pe for a post-dump fix-up pass.
+    stale_cell_names = _build_stale_cell_name_map(data_cell_apis, exports_dict)
+
+    iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
+                                                      text_section_range.base,
+                                                      process_controller)
+    LOG.info("Generated the fake IAT at %s, size=%s", hex(iat_addr),
+             hex(iat_size))
 
     # Ensure the range is writable
     process_controller.set_memory_protection(text_section_range.base,
@@ -108,7 +116,7 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
 
     LOG.info("Dumping PE with OEP=%s ...", hex(oep))
     dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-            iat_size, True)
+            iat_size, True, stale_cell_names)
 
 
 def _generate_export_hashes(
@@ -244,79 +252,52 @@ def _resolve_data_cell_wrappers(
         data_cell_apis[resolved_addr].append(cell_addr)
 
 
-def _generate_new_iat_and_trampolines_in_process(
-        imports_dict: ImportToCallSiteDict, data_cell_apis: DataCellDict,
-        near_to_ptr: int,
+def _build_stale_cell_name_map(
+        data_cell_apis: DataCellDict,
+        exports_dict: Dict[int, Dict[str, Any]]) -> Dict[str, List[int]]:
+    """
+    Turn the {resolved API address -> [data cell addresses]} mapping into
+    {import name -> [data cell addresses]}, which is what the post-dump
+    trampoline pass needs (it correlates against the rebuilt import table by
+    name, since Scylla relocates the IAT and the original resolved addresses
+    are live-only). Every key in `data_cell_apis` was resolved to an entry in
+    `exports_dict`, so a name is always available.
+    """
+    name_to_cells: Dict[str, List[int]] = {}
+    for api_addr, cell_addrs in data_cell_apis.items():
+        if not cell_addrs:
+            continue
+        export = exports_dict.get(api_addr)
+        if export is None or not export.get("name"):
+            LOG.debug("No export name for data-cell API %s", hex(api_addr))
+            continue
+        name_to_cells.setdefault(export["name"], []).extend(cell_addrs)
+    return name_to_cells
+
+
+def _generate_new_iat_in_process(
+        imports_dict: ImportToCallSiteDict, near_to_ptr: int,
         process_controller: ProcessController) -> Tuple[int, int]:
     """
-    Generate a new IAT from a list of imported function addresses, plus one
-    `jmp qword [iat_slot]` trampoline per API that's referenced from a raw
-    data cell (see `find_stale_data_pointers`), and patch each such cell to
-    point at its trampoline instead of the original live-only absolute
-    address. `near_to_ptr` is used to allocate the buffer near the unpacked
-    module (needed for 64-bit RIP-relative displacements).
-
-    A data cell holds a raw pointer VALUE, not a call/jmp instruction with an
-    operand -- it can't be rewritten in place the way `.text` call sites are
-    (that's what `_fix_import_references_in_process` does). Instead, each
-    such cell is redirected to a tiny synthesized thunk that re-reads the
-    resolved address from the (freshly rebuilt, correctly relocated at
-    runtime) fake IAT on every call, so it stays valid across ASLR-randomized
-    runs instead of freezing one process instance's live address.
+    Generate a new IAT from a list of imported function addresses and write
+    it into a new buffer into the target process. `near_to_ptr` is used to
+    allocate the new IAT near the unpacked module (which is needed for 64-bit
+    processes).
     """
     ptr_size = process_controller.pointer_size
     ptr_format = pointer_size_to_fmt(ptr_size)
     iat_size = len(imports_dict) * ptr_size
-    # One 6-byte `FF25 disp32` thunk per API actually referenced by a data
-    # cell (shared across every cell holding that same API's address).
-    trampoline_targets = [addr for addr in data_cell_apis if data_cell_apis[addr]]
-    trampoline_size = len(trampoline_targets) * 6
-    total_size = iat_size + trampoline_size
-
-    # Single allocation so the IAT and its trampolines land in one region
-    # (guaranteed nearby for the RIP-relative math, and guaranteed to be
-    # captured together by the dump/fix-IAT step via the returned size).
+    # Allocate a new buffer in the target process
     iat_addr = process_controller.allocate_process_memory(
-        total_size, near_to_ptr)
+        iat_size, near_to_ptr)
 
     # Generate the new IAT and write it into the buffer
     new_iat_data = bytearray()
-    slot_index: Dict[int, int] = {}
-    for i, import_addr in enumerate(imports_dict):
-        slot_index[import_addr] = i
+    for import_addr in imports_dict:
         new_iat_data += struct.pack(ptr_format, import_addr)
     process_controller.write_process_memory(iat_addr, list(new_iat_data))
 
-    # Generate one trampoline per referenced API and repoint its data cells
-    arch = process_controller.architecture
-    trampoline_base = iat_addr + iat_size
-    for j, api_addr in enumerate(trampoline_targets):
-        trampoline_addr = trampoline_base + j * 6
-        iat_slot_addr = iat_addr + slot_index[api_addr] * ptr_size
-        if arch == Architecture.X86_32:
-            # `FF25 disp32` on x86 addresses an absolute location, not
-            # PC-relative -- no subtraction, unlike the x64 RIP-relative form.
-            operand = iat_slot_addr
-            fmt = "<I"
-        elif arch == Architecture.X86_64:
-            operand = iat_slot_addr - (trampoline_addr + 6)
-            fmt = "<i"
-        else:
-            raise NotImplementedError(f"Unsupported architecture: {arch}")
-        thunk = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
-        process_controller.write_process_memory(trampoline_addr, list(thunk))
-
-        cell_bytes = list(struct.pack(ptr_format, trampoline_addr))
-        for cell_addr in data_cell_apis[api_addr]:
-            process_controller.write_process_memory(cell_addr, cell_bytes)
-
-    if trampoline_size > 0:
-        # The IAT slots only need to be read; the trampolines need to be
-        # executed. r-x covers both (data reads are permitted from
-        # executable pages).
-        process_controller.set_memory_protection(iat_addr, total_size, "r-x")
-
-    return iat_addr, total_size
+    return iat_addr, iat_size
 
 
 def _fix_import_references_in_process(
