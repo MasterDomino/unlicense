@@ -110,6 +110,8 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     # Ensure the range is writable
     process_controller.set_memory_protection(text_section_range.base,
                                              text_section_range.size, "rwx")
+    # Fix up jmp-thunk tables misclassified as calls (see the function docstring)
+    _promote_ilt_thunk_calls_to_jmps(api_to_calls)
     # Replace detected references to wrappers or imports
     LOG.info("Patching call and jmp sites ...")
     _fix_import_references_in_process(api_to_calls, iat_addr,
@@ -340,3 +342,47 @@ def _fix_import_references_in_process(
                 # call [iat_addr + i * ptr_size]
                 new_instr = bytes([0xFF, 0x15]) + struct.pack(fmt, operand)
             process_controller.write_process_memory(call_addr, list(new_instr))
+
+
+def _promote_ilt_thunk_calls_to_jmps(
+        api_to_calls: ImportToCallSiteDict) -> None:
+    """
+    MSVC emits import thunks (`jmp [__imp_X]`) packed into contiguous tables
+    that the rest of the code reaches with a `call`. `find_wrapped_imports`
+    only tags a thunk as a jmp when it is followed by int3/nop padding, so it
+    marks the *last* entry of such a table correctly but misclassifies the
+    interior entries as calls. A `call [IAT]` where a `jmp [IAT]` belongs makes
+    control fall through into the next table entry once the API returns --
+    calling unrelated APIs with garbage arguments and, because of the extra
+    return address, skewing 16-byte stack alignment until a callee faults on an
+    aligned SSE access (e.g. a crash deep inside iphlpapi/ntdll).
+
+    Any maximal run of back-to-back thunks (contiguous, same size) whose final
+    entry is already a jmp is such a table, so promote every call in the run to
+    a jmp. Two adjacent bare `call [IAT]` with no instructions between them does
+    not occur in real code, so this does not touch genuine inline calls.
+    """
+    # call_addr -> [api_addr, index_in_list, call_size, instr_was_jmp]
+    sites: Dict[int, List[Any]] = {}
+    for api_addr, call_list in api_to_calls.items():
+        for idx, (call_addr, call_size, instr_was_jmp) in enumerate(call_list):
+            sites[call_addr] = [api_addr, idx, call_size, instr_was_jmp]
+
+    addrs = sorted(sites)
+    i = 0
+    while i < len(addrs):
+        run = [addrs[i]]
+        while i + 1 < len(addrs) and \
+                addrs[i + 1] == addrs[i] + sites[addrs[i]][2]:
+            run.append(addrs[i + 1])
+            i += 1
+        i += 1
+        # A jmp-thunk table is a run of 2+ thunks anchored by a jmp terminal.
+        if len(run) >= 2 and sites[run[-1]][3]:
+            for addr in run:
+                sites[addr][3] = True
+
+    for call_addr, (api_addr, idx, call_size, was_jmp) in sites.items():
+        old = api_to_calls[api_addr][idx]
+        if old[2] != was_jmp:
+            api_to_calls[api_addr][idx] = (old[0], old[1], was_jmp)
