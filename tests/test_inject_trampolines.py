@@ -156,6 +156,26 @@ def test_second_alias_matches_when_first_misses():
     assert struct.unpack_from("<Q", out, 0x500)[0] == IMAGE_BASE + 0x3000
 
 
+def test_data_symbol_entry_is_not_trampolined():
+    # A cell resolving to a DATA symbol (locale id / static member) must NOT
+    # get a jmp trampoline -- jumping to non-exec .rdata DEP-faults. No section
+    # added when the only entry is a data symbol.
+    data = _build_pe()
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
+        tf.write(data)
+        path = tf.name
+    try:
+        _inject_data_cell_trampolines(
+            path, IMAGE_BASE,
+            [(["?id@?$ctype@_W@std@@2V0locale@2@A"], [IMAGE_BASE + 0x1100])],
+            ptr_size=8)
+        with open(path, "rb") as f:
+            out = f.read()
+    finally:
+        os.unlink(path)
+    assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 2  # no section
+
+
 def test_unresolvable_name_is_skipped_gracefully():
     # A cell whose import isn't in the table must not crash and must leave
     # the file's section count unchanged (nothing to trampoline).

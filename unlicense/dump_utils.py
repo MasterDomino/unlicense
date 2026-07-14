@@ -321,6 +321,20 @@ _FORWARDER_ALIASES = {
 }
 
 
+def _is_data_export_name(name: str) -> bool:
+    """
+    True for C++ mangled names that denote DATA, not a function -- static data
+    members (`?npos@...@2_K`), locale ids (`?id@...@2...A`), vtables
+    (`??_7...@6B@`), RTTI (`??_R...`), string literals (`??_C...`).
+
+    MSVC function mangling always ends in `Z` (`@Z` / `@XZ` from the signature);
+    data symbols never do. Plain C names (no leading `?`) are functions here.
+    A jmp trampoline to a data symbol lands in non-executable `.rdata` and
+    DEP-faults, so these must never be trampolined.
+    """
+    return name.startswith("?") and not name.endswith("Z")
+
+
 def _name_candidates(name: str):
     """Yield plausible import-table names for a resolved export name, most
     specific first: the name itself, a known forwarder alias, then the common
@@ -365,9 +379,17 @@ def _inject_data_cell_trampolines(
     resolved: List[Tuple[int, List[int]]] = []  # (slot RVA, cell VAs)
     missing_names: List[str] = []
     missing_cells = 0
+    data_skipped = 0
     for names, cells in stale_cell_entries:
+        # A data symbol can't be a jmp target; skip it (all aliases of one
+        # address share its kind, so testing any resolvable candidate is enough).
+        if all(_is_data_export_name(n) for n in names):
+            data_skipped += 1
+            continue
         slot = None
         for name in names:
+            if _is_data_export_name(name):
+                continue
             slot = next((name_to_slot[c] for c in _name_candidates(name)
                          if c in name_to_slot), None)
             if slot is not None:
@@ -377,6 +399,10 @@ def _inject_data_cell_trampolines(
             missing_names.append(names[0])
         else:
             resolved.append((slot, cells))
+    if data_skipped:
+        LOG.warning("Skipped %d data-symbol data-cell(s) (can't trampoline "
+                    "to non-code, e.g. locale ids / basic_string::npos)",
+                    data_skipped)
     if missing_names:
         LOG.warning("No IAT slot for %d data-cell API(s) / %d cell(s) "
                     "(e.g. %s); left unpatched", len(missing_names),
