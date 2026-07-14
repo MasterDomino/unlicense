@@ -72,6 +72,13 @@ class ProcessController(abc.ABC):
                                      ) -> Dict[int, Dict[str, Any]]:
         raise NotImplementedError
 
+    def enumerate_export_name_aliases(self) -> Dict[int, List[str]]:
+        """
+        Map each exported address to ALL names it's exported under (aliases).
+        Default: no alias info. Overridden by controllers that can provide it.
+        """
+        return {}
+
     @abc.abstractmethod
     def allocate_process_memory(self, size: int, near: int) -> int:
         raise NotImplementedError

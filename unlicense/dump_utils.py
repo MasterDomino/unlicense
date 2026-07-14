@@ -5,7 +5,7 @@ import platform
 import shutil
 import struct
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import lief
 import pyscylla  # type: ignore
@@ -71,7 +71,7 @@ def dump_pe(
     iat_addr: int,
     iat_size: int,
     add_new_iat: bool,
-    stale_cell_names: Optional[Dict[str, List[int]]] = None,
+    stale_cell_entries: Optional[List[Tuple[List[str], List[int]]]] = None,
 ) -> bool:
     # Reclaim as much memory as possible. This is kind of a hack for 32-bit
     # interpreters not to run out of memory when dumping.
@@ -112,11 +112,11 @@ def dump_pe(
         # cells walked as data by CRT init code) at freshly-built trampolines.
         # Must run on the FINAL file: it depends on where Scylla relocated the
         # IAT, and the trampoline section is appended after everything else.
-        if stale_cell_names:
+        if stale_cell_entries:
             LOG.info("Injecting %d data-cell trampoline(s) ...",
-                     sum(len(v) for v in stale_cell_names.values()))
+                     sum(len(cells) for _, cells in stale_cell_entries))
             _inject_data_cell_trampolines(
-                output_file_name, image_base, stale_cell_names,
+                output_file_name, image_base, stale_cell_entries,
                 process_controller.pointer_size)
 
         LOG.info("Output file has been saved at '%s'", output_file_name)
@@ -334,9 +334,10 @@ def _name_candidates(name: str):
         yield name[3:]
 
 
-def _inject_data_cell_trampolines(pe_path: str, image_base: int,
-                                  stale_cell_names: Dict[str, List[int]],
-                                  ptr_size: int) -> None:
+def _inject_data_cell_trampolines(
+        pe_path: str, image_base: int,
+        stale_cell_entries: List[Tuple[List[str], List[int]]],
+        ptr_size: int) -> None:
     """
     Append a new executable section of `FF25` trampolines to the dumped PE and
     re-point every stale data cell at its trampoline.
@@ -347,6 +348,10 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     live address -- now indirect through the Windows-loader-populated IAT and
     stay valid across runs. Done post-dump because it depends on where Scylla
     placed the rebuilt IAT.
+
+    `stale_cell_entries` is a list of (candidate import names, data cell VAs)
+    per resolved API. Each entry gets one trampoline; its first candidate name
+    (incl. forwarder aliases) found in the rebuilt import table wins.
     """
     with open(pe_path, "rb") as f:
         data = bytearray(f.read())
@@ -355,22 +360,28 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     ptr_fmt = "<Q" if is_64 else "<I"
     name_to_slot = _parse_import_name_to_iat_slot(bytes(data))
 
-    # Resolve each stale import name to a rebuilt IAT slot, trying forwarder
-    # aliases (ntdll Rtl* -> kernel32 name) when the exact name isn't present.
-    resolved_slot: Dict[str, int] = {}
-    missing = []
-    for name in stale_cell_names:
-        slot = next((name_to_slot[c] for c in _name_candidates(name)
-                     if c in name_to_slot), None)
+    # Resolve each entry to a single IAT slot, trying every candidate name and
+    # its forwarder aliases (ntdll Rtl* -> kernel32 name).
+    resolved: List[Tuple[int, List[int]]] = []  # (slot RVA, cell VAs)
+    missing_names: List[str] = []
+    missing_cells = 0
+    for names, cells in stale_cell_entries:
+        slot = None
+        for name in names:
+            slot = next((name_to_slot[c] for c in _name_candidates(name)
+                         if c in name_to_slot), None)
+            if slot is not None:
+                break
         if slot is None:
-            missing.append(name)
+            missing_cells += len(cells)
+            missing_names.append(names[0])
         else:
-            resolved_slot[name] = slot
-    tramp_names = list(resolved_slot)
-    if missing:
-        LOG.warning("No IAT slot for %d data-cell import(s) (e.g. %s); "
-                    "their cells left unpatched", len(missing), missing[:8])
-    if not tramp_names:
+            resolved.append((slot, cells))
+    if missing_names:
+        LOG.warning("No IAT slot for %d data-cell API(s) / %d cell(s) "
+                    "(e.g. %s); left unpatched", len(missing_names),
+                    missing_cells, missing_names[:8])
+    if not resolved:
         return
 
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
@@ -391,38 +402,32 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     new_va = _align_up(max(s["va"] + s["vsize"] for s in sections), sect_align)
     new_rawptr = _align_up(len(data), file_align)
 
-    # Build trampoline bytes now that we know the section's VA.
-    tramp_bytes = bytearray()
-    name_to_tramp_va: Dict[str, int] = {}
-    for j, name in enumerate(tramp_names):
-        tramp_va = image_base + new_va + j * 6
-        name_to_tramp_va[name] = tramp_va
-        slot_va = image_base + resolved_slot[name]
-        if is_64:
-            operand = struct.pack("<i", slot_va - (tramp_va + 6))
-        else:
-            operand = struct.pack("<I", slot_va)
-        tramp_bytes += b"\xff\x25" + operand
-
-    vsize = len(tramp_bytes)
-    rawsize = _align_up(vsize, file_align)
-
-    # Re-point the data cells (patch the dumped .text in place).
     def rva_to_off(rva: int) -> Optional[int]:
         for s in sections:
             if s["va"] <= rva < s["va"] + max(s["vsize"], s["rawsize"]):
                 return s["rawptr"] + (rva - s["va"])
         return None
 
+    # One trampoline per resolved entry; re-point that entry's cells at it.
+    tramp_bytes = bytearray()
     patched = 0
-    for name in tramp_names:
-        tramp_va = name_to_tramp_va[name]
-        for cell_va in stale_cell_names[name]:
+    for j, (slot_rva, cells) in enumerate(resolved):
+        tramp_va = image_base + new_va + j * 6
+        slot_va = image_base + slot_rva
+        if is_64:
+            operand = struct.pack("<i", slot_va - (tramp_va + 6))
+        else:
+            operand = struct.pack("<I", slot_va)
+        tramp_bytes += b"\xff\x25" + operand
+        for cell_va in cells:
             off = rva_to_off(cell_va - image_base)
             if off is None or off + ptr_size > len(data):
                 continue
             struct.pack_into(ptr_fmt, data, off, tramp_va)
             patched += 1
+
+    vsize = len(tramp_bytes)
+    rawsize = _align_up(vsize, file_align)
 
     # Append the section raw data (padded to file alignment).
     data += b"\x00" * (new_rawptr - len(data))
@@ -445,7 +450,7 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     with open(pe_path, "wb") as f:
         f.write(data)
     LOG.info("Injected %d trampoline(s), re-pointed %d data cell(s)",
-             len(tramp_names), patched)
+             len(resolved), patched)
 
 
 def pointer_size_to_fmt(pointer_size: int) -> str:

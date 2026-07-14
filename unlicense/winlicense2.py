@@ -90,12 +90,16 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
         if api_addr not in api_to_calls:
             api_to_calls[api_addr] = []
 
-    # Map each stale data cell to the *name* of the API it should call. The
+    # Map each stale data cell to the API name(s) it should call. The
     # trampolines that re-point these cells can only be built AFTER the dump
     # (Scylla discards anything handed to it as IAT data that isn't a valid
     # export pointer, and it relocates the IAT to a new section), so we resolve
-    # names now and hand them to dump_pe for a post-dump fix-up pass.
-    stale_cell_names = _build_stale_cell_name_map(data_cell_apis, exports_dict)
+    # names now and hand them to dump_pe for a post-dump fix-up pass. Every
+    # alias of the resolved address is kept, because Scylla may have imported
+    # the function under a different alias than the one frida happened to pick.
+    export_aliases = process_controller.enumerate_export_name_aliases()
+    stale_cell_entries = _build_stale_cell_entries(data_cell_apis, exports_dict,
+                                                   export_aliases)
 
     iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
                                                       text_section_range.base,
@@ -116,7 +120,7 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
 
     LOG.info("Dumping PE with OEP=%s ...", hex(oep))
     dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-            iat_size, True, stale_cell_names)
+            iat_size, True, stale_cell_entries)
 
 
 def _generate_export_hashes(
@@ -252,27 +256,33 @@ def _resolve_data_cell_wrappers(
         data_cell_apis[resolved_addr].append(cell_addr)
 
 
-def _build_stale_cell_name_map(
+def _build_stale_cell_entries(
         data_cell_apis: DataCellDict,
-        exports_dict: Dict[int, Dict[str, Any]]) -> Dict[str, List[int]]:
+        exports_dict: Dict[int, Dict[str, Any]],
+        export_aliases: Dict[int, List[str]]
+) -> List[Tuple[List[str], List[int]]]:
     """
-    Turn the {resolved API address -> [data cell addresses]} mapping into
-    {import name -> [data cell addresses]}, which is what the post-dump
-    trampoline pass needs (it correlates against the rebuilt import table by
-    name, since Scylla relocates the IAT and the original resolved addresses
-    are live-only). Every key in `data_cell_apis` was resolved to an entry in
-    `exports_dict`, so a name is always available.
+    Produce, per resolved data-cell API, the list of candidate import names
+    (all export aliases of the address) paired with the data cells that
+    reference it. The post-dump pass tries each candidate against the rebuilt
+    import table -- Scylla may have imported the function under a different
+    alias than the one frida reported (e.g. basic_string<wchar_t> vs
+    <unsigned short>), so a single name isn't enough.
     """
-    name_to_cells: Dict[str, List[int]] = {}
+    entries: List[Tuple[List[str], List[int]]] = []
     for api_addr, cell_addrs in data_cell_apis.items():
         if not cell_addrs:
             continue
+        names = list(export_aliases.get(api_addr, []))
         export = exports_dict.get(api_addr)
-        if export is None or not export.get("name"):
+        if export is not None and export.get("name") \
+                and export["name"] not in names:
+            names.append(export["name"])
+        if not names:
             LOG.debug("No export name for data-cell API %s", hex(api_addr))
             continue
-        name_to_cells.setdefault(export["name"], []).extend(cell_addrs)
-    return name_to_cells
+        entries.append((names, cell_addrs))
+    return entries
 
 
 def _generate_new_iat_in_process(

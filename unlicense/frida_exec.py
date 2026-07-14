@@ -36,6 +36,7 @@ class FridaProcessController(ProcessController):
         self._frida_session = frida_session
         self._exported_functions_cache: Optional[Dict[int, Dict[str,
                                                                 Any]]] = None
+        self._export_aliases_cache: Optional[Dict[int, List[str]]] = None
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         value: Optional[Dict[str,
@@ -85,10 +86,28 @@ class FridaProcessController(ProcessController):
             value: List[Dict[
                 str, Any]] = self._frida_rpc.enumerate_exported_functions(
                     self.main_module_name)
+            # A single address is often exported under several names (e.g. VC++
+            # /Zc:wchar_t- makes basic_string<wchar_t> and basic_string<unsigned
+            # short> alias the same code). Keep ALL names per address so import
+            # matching can try every alias -- the {addr: entry} dict below only
+            # keeps one. Frida enumerates every export of every module, so the
+            # name any other tool (Scylla) picked is guaranteed to be in here.
+            aliases: Dict[int, List[str]] = {}
+            for e in value:
+                name = e.get("name")
+                if name:
+                    aliases.setdefault(int(e["address"], 16), []).append(name)
+            self._export_aliases_cache = aliases
             exports_dict = {int(e["address"], 16): e for e in value}
             self._exported_functions_cache = exports_dict
             return exports_dict
         return self._exported_functions_cache
+
+    def enumerate_export_name_aliases(self) -> Dict[int, List[str]]:
+        if self._export_aliases_cache is None:
+            self.enumerate_exported_functions()
+        assert self._export_aliases_cache is not None
+        return self._export_aliases_cache
 
     def allocate_process_memory(self, size: int, near: int) -> int:
         buffer_addr = self._frida_rpc.allocate_process_memory(size, near)

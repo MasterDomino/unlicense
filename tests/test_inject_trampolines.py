@@ -73,7 +73,7 @@ def test_full_injection_round_trip():
     try:
         cell_va = IMAGE_BASE + 0x1100
         _inject_data_cell_trampolines(
-            path, IMAGE_BASE, {"FreeConsole": [cell_va]}, ptr_size=8)
+            path, IMAGE_BASE, [(["FreeConsole"], [cell_va])], ptr_size=8)
         with open(path, "rb") as f:
             out = bytearray(f.read())
     finally:
@@ -124,13 +124,34 @@ def test_stale_cell_patched_via_forwarder_alias():
     try:
         cell_va = IMAGE_BASE + 0x1100
         _inject_data_cell_trampolines(
-            path, IMAGE_BASE, {"RtlEnterCriticalSection": [cell_va]},
+            path, IMAGE_BASE, [(["RtlEnterCriticalSection"], [cell_va])],
             ptr_size=8)
         with open(path, "rb") as f:
             out = f.read()
     finally:
         os.unlink(path)
     # section added and cell re-pointed => alias matched
+    assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 3
+    assert struct.unpack_from("<Q", out, 0x500)[0] == IMAGE_BASE + 0x3000
+
+
+def test_second_alias_matches_when_first_misses():
+    # Import table has FreeConsole; the cell's primary frida name is a wchar
+    # alias that isn't imported, but the second candidate (FreeConsole) is.
+    data = _build_pe()
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
+        tf.write(data)
+        path = tf.name
+    try:
+        cell_va = IMAGE_BASE + 0x1100
+        _inject_data_cell_trampolines(
+            path, IMAGE_BASE,
+            [(["SomeWcharAliasNotImported", "FreeConsole"], [cell_va])],
+            ptr_size=8)
+        with open(path, "rb") as f:
+            out = f.read()
+    finally:
+        os.unlink(path)
     assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 3
     assert struct.unpack_from("<Q", out, 0x500)[0] == IMAGE_BASE + 0x3000
 
@@ -144,7 +165,7 @@ def test_unresolvable_name_is_skipped_gracefully():
         path = tf.name
     try:
         _inject_data_cell_trampolines(
-            path, IMAGE_BASE, {"NotARealImport": [IMAGE_BASE + 0x1100]},
+            path, IMAGE_BASE, [(["NotARealImport"], [IMAGE_BASE + 0x1100])],
             ptr_size=8)
         with open(path, "rb") as f:
             out = f.read()
