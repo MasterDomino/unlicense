@@ -307,6 +307,33 @@ def _read_section_headers(data: bytes) -> List[Dict[str, int]]:
     return sections
 
 
+# kernel32 forwards many exports to ntdll under a different name (e.g.
+# EnterCriticalSection -> ntdll.RtlEnterCriticalSection). Themida resolves the
+# app's calls straight to the ntdll target, so frida reports the ntdll name
+# (RtlEnterCriticalSection), but Scylla imports it under the kernel32 name the
+# app's PE actually references. The forwarder resolves to the same code, so
+# matching to the kernel32 name is functionally identical.
+_FORWARDER_ALIASES = {
+    "RtlAllocateHeap": "HeapAlloc",
+    "RtlReAllocateHeap": "HeapReAlloc",
+    "RtlFreeHeap": "HeapFree",
+    "RtlSizeHeap": "HeapSize",
+}
+
+
+def _name_candidates(name: str):
+    """Yield plausible import-table names for a resolved export name, most
+    specific first: the name itself, a known forwarder alias, then the common
+    kernel32-forwards-to-ntdll `Rtl` prefix strip (RtlEnterCriticalSection ->
+    EnterCriticalSection)."""
+    yield name
+    alias = _FORWARDER_ALIASES.get(name)
+    if alias is not None:
+        yield alias
+    if name.startswith("Rtl") and len(name) > 3:
+        yield name[3:]
+
+
 def _inject_data_cell_trampolines(pe_path: str, image_base: int,
                                   stale_cell_names: Dict[str, List[int]],
                                   ptr_size: int) -> None:
@@ -328,12 +355,21 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     ptr_fmt = "<Q" if is_64 else "<I"
     name_to_slot = _parse_import_name_to_iat_slot(bytes(data))
 
-    # Keep only names we can actually resolve to a rebuilt IAT slot.
-    tramp_names = [n for n in stale_cell_names if n in name_to_slot]
-    missing = [n for n in stale_cell_names if n not in name_to_slot]
+    # Resolve each stale import name to a rebuilt IAT slot, trying forwarder
+    # aliases (ntdll Rtl* -> kernel32 name) when the exact name isn't present.
+    resolved_slot: Dict[str, int] = {}
+    missing = []
+    for name in stale_cell_names:
+        slot = next((name_to_slot[c] for c in _name_candidates(name)
+                     if c in name_to_slot), None)
+        if slot is None:
+            missing.append(name)
+        else:
+            resolved_slot[name] = slot
+    tramp_names = list(resolved_slot)
     if missing:
         LOG.warning("No IAT slot for %d data-cell import(s) (e.g. %s); "
-                    "their cells left unpatched", len(missing), missing[:5])
+                    "their cells left unpatched", len(missing), missing[:8])
     if not tramp_names:
         return
 
@@ -361,7 +397,7 @@ def _inject_data_cell_trampolines(pe_path: str, image_base: int,
     for j, name in enumerate(tramp_names):
         tramp_va = image_base + new_va + j * 6
         name_to_tramp_va[name] = tramp_va
-        slot_va = image_base + name_to_slot[name]
+        slot_va = image_base + resolved_slot[name]
         if is_64:
             operand = struct.pack("<i", slot_va - (tramp_va + 6))
         else:

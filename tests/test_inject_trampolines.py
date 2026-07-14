@@ -11,7 +11,8 @@ import tempfile
 
 from unlicense.dump_utils import (_inject_data_cell_trampolines,
                                   _parse_import_name_to_iat_slot,
-                                  _read_section_headers, _align_up)
+                                  _read_section_headers, _align_up,
+                                  _name_candidates)
 
 IMAGE_BASE = 0x140000000
 E_LFANEW = 0x80
@@ -97,6 +98,41 @@ def test_full_injection_round_trip():
     disp = struct.unpack_from("<i", out, off + 2)[0]
     # Effective target must be the FreeConsole IAT slot (RVA 0x2040)
     assert tramp_va + 6 + disp == IMAGE_BASE + 0x2040
+
+
+def test_forwarder_alias_resolution():
+    # ntdll Rtl* name resolves to the kernel32 forwarder name via prefix strip,
+    # and the known heap map covers the non-prefix cases.
+    assert list(_name_candidates("RtlEnterCriticalSection"))[-1] == \
+        "EnterCriticalSection"
+    assert "HeapReAlloc" in _name_candidates("RtlReAllocateHeap")
+    assert list(_name_candidates("memcpy")) == ["memcpy"]
+
+
+def test_stale_cell_patched_via_forwarder_alias():
+    # Build a PE whose import table has EnterCriticalSection (kernel32 name),
+    # but the stale cell's frida-resolved name is RtlEnterCriticalSection.
+    # The alias strip must still find and patch it.
+    data = _build_pe()
+    # rename the imported function to EnterCriticalSection
+    b = 0x600
+    data[b + 0x62:b + 0x62 + 20] = b"EnterCriticalSection\x00"[:20]
+    data[b + 0x62 + 20] = 0
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
+        tf.write(data)
+        path = tf.name
+    try:
+        cell_va = IMAGE_BASE + 0x1100
+        _inject_data_cell_trampolines(
+            path, IMAGE_BASE, {"RtlEnterCriticalSection": [cell_va]},
+            ptr_size=8)
+        with open(path, "rb") as f:
+            out = f.read()
+    finally:
+        os.unlink(path)
+    # section added and cell re-pointed => alias matched
+    assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 3
+    assert struct.unpack_from("<Q", out, 0x500)[0] == IMAGE_BASE + 0x3000
 
 
 def test_unresolvable_name_is_skipped_gracefully():
