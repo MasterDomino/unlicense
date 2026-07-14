@@ -157,9 +157,10 @@ def test_second_alias_matches_when_first_misses():
 
 
 def test_data_symbol_entry_is_not_trampolined():
-    # A cell resolving to a DATA symbol (locale id / static member) must NOT
-    # get a jmp trampoline -- jumping to non-exec .rdata DEP-faults. No section
-    # added when the only entry is a data symbol.
+    # A DATA symbol (locale id / static member) must NOT get a jmp trampoline --
+    # jumping to non-exec .rdata DEP-faults, and the CRT reads it as data anyway.
+    # Here it's also not in the import table, so it can't be bound either and is
+    # left unpatched: no section added.
     data = _build_pe()
     with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
         tf.write(data)
@@ -174,6 +175,86 @@ def test_data_symbol_entry_is_not_trampolined():
     finally:
         os.unlink(path)
     assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 2  # no section
+
+
+def _build_pe_with_data_import():
+    """Minimal PE32+ importing one DATA symbol (`_acmdln`) with roomy,
+    non-overlapping .idata offsets, plus a stale cell at RVA 0x1010."""
+    data = bytearray(0xA00)
+    data[0:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, E_LFANEW)
+    data[E_LFANEW:E_LFANEW + 4] = b"PE\x00\x00"
+    struct.pack_into("<H", data, E_LFANEW + 0x4, 0x8664)
+    struct.pack_into("<H", data, E_LFANEW + 0x6, 2)
+    struct.pack_into("<H", data, E_LFANEW + 0x14, 0xF0)
+    struct.pack_into("<H", data, E_LFANEW + 0x16, 0x22)
+    opt = E_LFANEW + 0x18
+    struct.pack_into("<H", data, opt + 0x00, 0x20B)
+    struct.pack_into("<Q", data, opt + 0x18, IMAGE_BASE)   # ImageBase
+    struct.pack_into("<I", data, opt + 0x20, 0x1000)       # SectionAlignment
+    struct.pack_into("<I", data, opt + 0x24, 0x200)        # FileAlignment
+    struct.pack_into("<I", data, opt + 0x38, 0x3000)       # SizeOfImage
+    struct.pack_into("<I", data, opt + 0x3C, 0x400)        # SizeOfHeaders
+    struct.pack_into("<I", data, opt + 0x6C, 16)
+    struct.pack_into("<II", data, opt + 0x70 + 8, 0x2000, 0x28)  # import dir
+    sec = E_LFANEW + 0x108
+    struct.pack_into("<8sIIIIIIHHI", data, sec, b".text",
+                     0x200, 0x1000, 0x200, 0x400, 0, 0, 0, 0, 0x60000020)
+    struct.pack_into("<8sIIIIIIHHI", data, sec + 40, b".idata",
+                     0x200, 0x2000, 0x200, 0x600, 0, 0, 0, 0, 0xC0000040)
+    b = 0x600  # raw base for VA 0x2000
+    # descriptor[0]: OFT=0x20A0, name=0x2010, FT=0x20C0 ; descriptor[1]=null
+    struct.pack_into("<IIIII", data, b + 0x00, 0x20A0, 0, 0, 0x2010, 0x20C0)
+    data[b + 0x10:b + 0x19] = b"TEST.dll\x00"
+    struct.pack_into("<Q", data, b + 0xA0, 0x2060)   # ILT[0] -> by-name
+    struct.pack_into("<Q", data, b + 0xC0, 0x2060)   # IAT[0] (slot RVA 0x20C0)
+    struct.pack_into("<H", data, b + 0x60, 0)        # hint
+    data[b + 0x62:b + 0x62 + 8] = b"_acmdln\x00"
+    return data
+
+
+def test_data_symbol_bound_as_import():
+    # A DATA symbol present in the import table gets a loader-bound import
+    # (FirstThunk = the cell RVA), never a code trampoline. The loader will
+    # write &symbol into the cell, satisfying the CRT's double-deref.
+    data = _build_pe_with_data_import()
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
+        tf.write(data)
+        path = tf.name
+    try:
+        cell_va = IMAGE_BASE + 0x1010
+        _inject_data_cell_trampolines(
+            path, IMAGE_BASE, [(["_acmdln"], [cell_va])], ptr_size=8)
+        with open(path, "rb") as f:
+            out = bytearray(f.read())
+    finally:
+        os.unlink(path)
+
+    # One section added (.idata3 with the relocated import array), NOT .idata2.
+    assert struct.unpack_from("<H", out, E_LFANEW + 0x6)[0] == 3
+    secs = _read_section_headers(bytes(out))
+    new_sec = max(secs, key=lambda s: s["va"])
+    # Import data directory now points at the new descriptor array.
+    opt = E_LFANEW + 0x18
+    import_rva = struct.unpack_from("<I", out, opt + 0x70 + 8)[0]
+    assert import_rva == new_sec["va"]
+    # Walk descriptors; the last non-null must bind the cell to _acmdln.
+    off = new_sec["rawptr"]
+    descs = []
+    while out[off:off + 20] != b"\x00" * 20:
+        descs.append(struct.unpack_from("<IIIII", out, off))
+        off += 20
+    oft, _, _, name_rva, first_thunk = descs[-1]
+    assert first_thunk == 0x1010                      # FirstThunk == cell RVA
+    n_off = next(s["rawptr"] + (name_rva - s["va"]) for s in secs
+                 if s["va"] <= name_rva < s["va"] + max(s["vsize"], s["rawsize"]))
+    assert out[n_off:out.index(b"\x00", n_off)] == b"TEST.dll"
+    ilt_off = next(s["rawptr"] + (oft - s["va"]) for s in secs
+                   if s["va"] <= oft < s["va"] + max(s["vsize"], s["rawsize"]))
+    byname_rva = struct.unpack_from("<Q", out, ilt_off)[0]
+    bn_off = next(s["rawptr"] + (byname_rva - s["va"]) for s in secs
+                  if s["va"] <= byname_rva < s["va"] + max(s["vsize"], s["rawsize"]))
+    assert out[bn_off + 2:out.index(b"\x00", bn_off + 2)] == b"_acmdln"
 
 
 def test_unresolvable_name_is_skipped_gracefully():

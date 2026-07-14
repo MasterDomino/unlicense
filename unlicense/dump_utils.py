@@ -229,6 +229,18 @@ def _align_up(value: int, alignment: int) -> int:
 def _parse_import_name_to_iat_slot(data: bytes) -> Dict[str, int]:
     """
     Parse a PE's import directory and return {import name -> IAT slot RVA}.
+    """
+    return {name: slot for _, name, slot in _iter_import_names(data)}
+
+
+def _parse_import_name_to_dll(data: bytes) -> Dict[str, str]:
+    """Parse a PE's import directory and return {import name -> DLL name}."""
+    return {name: dll for dll, name, _ in _iter_import_names(data)}
+
+
+def _iter_import_names(data: bytes):
+    """
+    Yield (dll_name, import_name, IAT slot RVA) for every named import.
 
     Deterministic, dependency-free (plain struct) so it doesn't rely on a
     specific `lief` version's import-parsing API. Ordinal-only imports (no
@@ -245,7 +257,7 @@ def _parse_import_name_to_iat_slot(data: bytes) -> Dict[str, int]:
     dd_offset = e_lfanew + 0x18 + (0x70 if is_64 else 0x60)
     import_rva = struct.unpack_from("<I", data, dd_offset + 1 * 8)[0]
     if import_rva == 0:
-        return {}
+        return
 
     sections = _read_section_headers(data)
 
@@ -262,16 +274,16 @@ def _parse_import_name_to_iat_slot(data: bytes) -> Dict[str, int]:
         end = data.find(b"\x00", off)
         return data[off:end].decode("latin1") if end != -1 else ""
 
-    name_to_slot: Dict[str, int] = {}
     desc_off = rva_to_off(import_rva)
     if desc_off is None:
-        return {}
+        return
     # IMAGE_IMPORT_DESCRIPTOR is 20 bytes; array terminated by an all-zero one.
     while True:
         orig_first_thunk, _, _, name_rva, first_thunk = struct.unpack_from(
             "<IIIII", data, desc_off)
         if orig_first_thunk == 0 and first_thunk == 0 and name_rva == 0:
             break
+        dll_name = read_cstr(name_rva)
         # ILT (OriginalFirstThunk) holds the names; fall back to IAT if absent.
         lookup_rva = orig_first_thunk or first_thunk
         lookup_off = rva_to_off(lookup_rva)
@@ -286,11 +298,9 @@ def _parse_import_name_to_iat_slot(data: bytes) -> Dict[str, int]:
                     # thunk = RVA to IMAGE_IMPORT_BY_NAME (2-byte hint + name)
                     name = read_cstr((thunk & (ordinal_flag - 1)) + 2)
                     if name:
-                        name_to_slot[name] = first_thunk + idx * thunk_size
+                        yield dll_name, name, first_thunk + idx * thunk_size
                 idx += 1
         desc_off += 20
-
-    return name_to_slot
 
 
 def _read_section_headers(data: bytes) -> List[Dict[str, int]]:
@@ -321,18 +331,36 @@ _FORWARDER_ALIASES = {
 }
 
 
+# Plain-C CRT/kernel data exports (no `?` mangling, so the C++ rule below can't
+# spot them). The packer hijacks their `__imp_` slots just like any import, but
+# CRT startup reads them as DATA (`mov rax,[cell]; mov rbx,[rax]` -- a double
+# deref), so they need a loader-bound cell, never a code trampoline. `_acmdln`
+# is THE one that crashes __scrt_narrow_argv; the rest are the common CRT
+# globals hijacked the same way (cheap insurance against the next such crash).
+_KNOWN_DATA_EXPORTS = {
+    "_acmdln", "_wcmdln", "_commode", "_fmode", "_environ", "_wenviron",
+    "__initenv", "__winitenv", "_pgmptr", "_wpgmptr", "_osplatform", "_osver",
+    "_winver", "_winmajor", "_winminor", "_pctype", "_pwctype", "_mbctype",
+    "__mb_cur_max", "__argc", "__argv", "__wargv", "_HUGE", "_daylight",
+    "_timezone", "_tzname", "_sys_errlist", "_sys_nerr",
+}
+
+
 def _is_data_export_name(name: str) -> bool:
     """
-    True for C++ mangled names that denote DATA, not a function -- static data
-    members (`?npos@...@2_K`), locale ids (`?id@...@2...A`), vtables
-    (`??_7...@6B@`), RTTI (`??_R...`), string literals (`??_C...`).
+    True for names that denote DATA, not a function.
 
-    MSVC function mangling always ends in `Z` (`@Z` / `@XZ` from the signature);
-    data symbols never do. Plain C names (no leading `?`) are functions here.
-    A jmp trampoline to a data symbol lands in non-executable `.rdata` and
-    DEP-faults, so these must never be trampolined.
+    C++ static data members (`?npos@...@2_K`), locale ids (`?id@...@2...A`),
+    vtables (`??_7...@6B@`), RTTI (`??_R...`), string literals (`??_C...`):
+    MSVC function mangling always ends in `Z` (`@Z` / `@XZ` from the signature),
+    data symbols never do. Plain C names have no such rule, so the well-known
+    CRT data globals are matched by an explicit set. Data cells can't be code
+    trampolines (jmp to non-exec `.rdata`, and the CRT reads them as data
+    anyway) -- they're bound as imports instead (see `_bind_data_cells_...`).
     """
-    return name.startswith("?") and not name.endswith("Z")
+    if name.startswith("?"):
+        return not name.endswith("Z")
+    return name in _KNOWN_DATA_EXPORTS
 
 
 def _name_candidates(name: str):
@@ -353,19 +381,18 @@ def _inject_data_cell_trampolines(
         stale_cell_entries: List[Tuple[List[str], List[int]]],
         ptr_size: int) -> None:
     """
-    Append a new executable section of `FF25` trampolines to the dumped PE and
-    re-point every stale data cell at its trampoline.
-
-    Each trampoline is `jmp qword [import_slot]` (x64: RIP-relative; x86:
-    absolute), so the packer's resolved-import-cache cells -- which CRT
-    startup calls as function pointers but which held a frozen, ASLR-dependent
-    live address -- now indirect through the Windows-loader-populated IAT and
-    stay valid across runs. Done post-dump because it depends on where Scylla
-    placed the rebuilt IAT.
+    Fix the packer's stale "resolved import cache" cells post-dump, routing
+    each by kind: a CODE cell (a cached function pointer the CRT calls) gets an
+    `FF25 jmp [import_slot]` trampoline (see `_append_trampoline_section`); a
+    DATA cell (a cached `__imp_` data slot the CRT double-derefs, e.g.
+    `_acmdln`) is rebound as a real named import (see
+    `_bind_data_cells_as_imports`). Both indirect through the Windows-loader-
+    populated import table, so they stay valid across runs. Done post-dump
+    because it depends on where Scylla placed the rebuilt imports.
 
     `stale_cell_entries` is a list of (candidate import names, data cell VAs)
-    per resolved API. Each entry gets one trampoline; its first candidate name
-    (incl. forwarder aliases) found in the rebuilt import table wins.
+    per resolved API; the first candidate (incl. forwarder aliases) found in
+    the rebuilt import table wins.
     """
     with open(pe_path, "rb") as f:
         data = bytearray(f.read())
@@ -373,43 +400,55 @@ def _inject_data_cell_trampolines(
     is_64 = ptr_size == 8
     ptr_fmt = "<Q" if is_64 else "<I"
     name_to_slot = _parse_import_name_to_iat_slot(bytes(data))
+    name_to_dll = _parse_import_name_to_dll(bytes(data))
 
-    # Resolve each entry to a single IAT slot, trying every candidate name and
-    # its forwarder aliases (ntdll Rtl* -> kernel32 name).
+    # Split each entry into a code cell (trampoline through the IAT) or a data
+    # cell (loader-bound import, see `_bind_data_cells_as_imports`). All aliases
+    # of one address share its kind, so `any` data-looking alias => data cell.
     resolved: List[Tuple[int, List[int]]] = []  # (slot RVA, cell VAs)
+    data_bindings: List[Tuple[str, str, List[int]]] = []  # (dll, sym, cell VAs)
     missing_names: List[str] = []
     missing_cells = 0
-    data_skipped = 0
     for names, cells in stale_cell_entries:
-        # A data symbol can't be a jmp target; skip it (all aliases of one
-        # address share its kind, so testing any resolvable candidate is enough).
-        if all(_is_data_export_name(n) for n in names):
-            data_skipped += 1
+        if any(_is_data_export_name(n) for n in names):
+            # Data symbol: resolve its DLL + name from the rebuilt import table
+            # (Scylla already imports it) so the loader can bind the cell too.
+            dll_sym = next(
+                ((name_to_dll[c], c)
+                 for name in names for c in _name_candidates(name)
+                 if c in name_to_dll), None)
+            if dll_sym is None:
+                missing_cells += len(cells)
+                missing_names.append(names[0])
+            else:
+                data_bindings.append((dll_sym[0], dll_sym[1], cells))
             continue
-        slot = None
-        for name in names:
-            if _is_data_export_name(name):
-                continue
-            slot = next((name_to_slot[c] for c in _name_candidates(name)
-                         if c in name_to_slot), None)
-            if slot is not None:
-                break
+        slot = next(
+            (name_to_slot[c] for name in names
+             for c in _name_candidates(name) if c in name_to_slot), None)
         if slot is None:
             missing_cells += len(cells)
             missing_names.append(names[0])
         else:
             resolved.append((slot, cells))
-    if data_skipped:
-        LOG.warning("Skipped %d data-symbol data-cell(s) (can't trampoline "
-                    "to non-code, e.g. locale ids / basic_string::npos)",
-                    data_skipped)
     if missing_names:
-        LOG.warning("No IAT slot for %d data-cell API(s) / %d cell(s) "
+        LOG.warning("No import for %d data-cell API(s) / %d cell(s) "
                     "(e.g. %s); left unpatched", len(missing_names),
                     missing_cells, missing_names[:8])
-    if not resolved:
-        return
 
+    if resolved:
+        _append_trampoline_section(pe_path, data, image_base, resolved,
+                                   is_64, ptr_fmt, ptr_size)
+    if data_bindings:
+        _bind_data_cells_as_imports(pe_path, image_base, data_bindings,
+                                    ptr_size)
+    return
+
+
+def _append_trampoline_section(
+        pe_path: str, data: bytearray, image_base: int,
+        resolved: List[Tuple[int, List[int]]], is_64: bool, ptr_fmt: str,
+        ptr_size: int) -> None:
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     sect_align = struct.unpack_from("<I", data, e_lfanew + 0x38)[0]
     file_align = struct.unpack_from("<I", data, e_lfanew + 0x3C)[0]
@@ -477,6 +516,138 @@ def _inject_data_cell_trampolines(
         f.write(data)
     LOG.info("Injected %d trampoline(s), re-pointed %d data cell(s)",
              len(resolved), patched)
+
+
+def _bind_data_cells_as_imports(
+        pe_path: str, image_base: int,
+        bindings: List[Tuple[str, str, List[int]]], ptr_size: int) -> None:
+    """
+    Turn each stale DATA cell into a Windows-loader-bound import slot.
+
+    A data cell (e.g. `_acmdln`, a locale `id`) is read as data, not called:
+    CRT startup does `mov rax,[cell]; mov rbx,[rax]`, so the cell must hold
+    `&symbol` at run time -- a code trampoline can't provide that, and the
+    packer's frozen ASLR value is stale. The fix is to make the cell itself a
+    named import's `FirstThunk`: the loader writes `&symbol` into it, exactly
+    like the original (pre-pack) `__imp_` slot.
+
+    One `IMAGE_IMPORT_DESCRIPTOR` per cell (its own `FirstThunk` = the cell RVA,
+    since cells are scattered), plus a relocated descriptor array in a fresh
+    section (the existing one has no slack). The dump has ASLR stripped, so
+    everything is RVA-addressed -- no relocations needed. The loader only
+    unprotects the region named by the IAT data-directory (Scylla's rebuilt
+    IAT) while snapping, so any `.text` section holding a bound cell is marked
+    MEM_WRITE here -- otherwise the loader's write to the (scattered, out-of-IAT)
+    cell would fault at load. Themida dumps already ship W+X sections, so this
+    doesn't change the artifact's posture.
+    """
+    with open(pe_path, "rb") as f:
+        data = bytearray(f.read())
+
+    is_64 = ptr_size == 8
+    thunk_fmt = "<Q" if is_64 else "<I"
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    sect_align = struct.unpack_from("<I", data, e_lfanew + 0x38)[0]
+    file_align = struct.unpack_from("<I", data, e_lfanew + 0x3C)[0]
+    num_sections = struct.unpack_from("<H", data, e_lfanew + 0x6)[0]
+    size_opt_hdr = struct.unpack_from("<H", data, e_lfanew + 0x14)[0]
+    sec_table = e_lfanew + 0x18 + size_opt_hdr
+    dd_offset = e_lfanew + 0x18 + (0x70 if is_64 else 0x60)
+    import_dd = dd_offset + 1 * 8
+
+    sections = _read_section_headers(bytes(data))
+    first_section_rawptr = min(s["rawptr"] for s in sections if s["rawptr"])
+    if sec_table + (num_sections + 1) * 40 > first_section_rawptr:
+        LOG.error("No room for a new section header; skipping data-cell binds")
+        return
+
+    def rva_to_off(rva: int) -> Optional[int]:
+        for s in sections:
+            if s["va"] <= rva < s["va"] + max(s["vsize"], s["rawsize"]):
+                return s["rawptr"] + (rva - s["va"])
+        return None
+
+    # Copy the existing descriptor array verbatim (its ILT/Name/FirstThunk RVAs
+    # stay valid -- we only move the array itself), dropping the null terminator.
+    import_rva = struct.unpack_from("<I", data, import_dd)[0]
+    off = rva_to_off(import_rva)
+    existing_descs = bytearray()
+    while off is not None and data[off:off + 20] != b"\x00" * 20:
+        existing_descs += data[off:off + 20]
+        off += 20
+
+    cell_count = sum(len(cells) for _, _, cells in bindings)
+    new_va = _align_up(max(s["va"] + s["vsize"] for s in sections), sect_align)
+
+    # Section layout: [descriptor array][dll strings][name blobs][ILTs]. Build
+    # the trailing blobs first (need their RVAs), then back-fill the array.
+    desc_array_size = (len(existing_descs) // 20 + cell_count + 1) * 20
+    section = bytearray(existing_descs) + b"\x00" * ((cell_count + 1) * 20)
+
+    def cur_rva() -> int:
+        return new_va + len(section)
+
+    dll_rva: Dict[str, int] = {}
+    for dll in dict.fromkeys(b[0] for b in bindings):
+        dll_rva[dll] = cur_rva()
+        section += dll.encode("ascii") + b"\x00"
+
+    syms = list(dict.fromkeys(b[1] for b in bindings))
+    name_rva: Dict[str, int] = {}
+    for sym in syms:
+        if len(section) & 1:  # IMAGE_IMPORT_BY_NAME is WORD-aligned
+            section += b"\x00"
+        name_rva[sym] = cur_rva()
+        section += b"\x00\x00" + sym.encode("ascii") + b"\x00"  # hint + name
+    ilt_rva: Dict[str, int] = {}
+    for sym in syms:
+        while (new_va + len(section)) % ptr_size:
+            section += b"\x00"
+        ilt_rva[sym] = cur_rva()
+        section += struct.pack(thunk_fmt, name_rva[sym])  # ILT[0] = &by_name
+        section += struct.pack(thunk_fmt, 0)              # ILT[1] = terminator
+
+    # Back-fill one descriptor per cell: FirstThunk = the (scattered) cell RVA.
+    # Mark each cell's host section MEM_WRITE so the loader can snap into it.
+    di = len(existing_descs)
+    MEM_WRITE = 0x80000000
+    for dll, sym, cells in bindings:
+        for cell_va in cells:
+            cell_rva = cell_va - image_base
+            struct.pack_into("<IIIII", section, di,
+                             ilt_rva[sym], 0, 0, dll_rva[dll], cell_rva)
+            di += 20
+            for s in sections:
+                if s["va"] <= cell_rva < s["va"] + max(s["vsize"], s["rawsize"]):
+                    ch = struct.unpack_from("<I", data, s["off"] + 0x24)[0]
+                    struct.pack_into("<I", data, s["off"] + 0x24,
+                                     ch | MEM_WRITE)
+                    break
+
+    vsize = len(section)
+    rawsize = _align_up(vsize, file_align)
+    new_rawptr = _align_up(len(data), file_align)
+    data += b"\x00" * (new_rawptr - len(data))
+    data += section + b"\x00" * (rawsize - vsize)
+
+    CNT_INIT_READ = 0x40000040  # initialized data, read-only
+    header = struct.pack("<8sIIIIIIHHI", b".idata3\x00"[:8], vsize, new_va,
+                         rawsize, new_rawptr, 0, 0, 0, 0, CNT_INIT_READ)
+    data[sec_table + num_sections * 40:
+         sec_table + num_sections * 40 + 40] = header
+
+    struct.pack_into("<H", data, e_lfanew + 0x6, num_sections + 1)
+    struct.pack_into("<I", data, e_lfanew + 0x50,
+                     _align_up(new_va + vsize, sect_align))
+    # Re-point the import data directory at the relocated (now larger) array.
+    struct.pack_into("<I", data, import_dd, new_va)
+    struct.pack_into("<I", data, import_dd + 4, desc_array_size)
+    struct.pack_into("<I", data, e_lfanew + 0x58, 0)  # invalidate checksum
+
+    with open(pe_path, "wb") as f:
+        f.write(data)
+    LOG.info("Bound %d data cell(s) as loader imports across %d symbol(s)",
+             cell_count, len(syms))
 
 
 def pointer_size_to_fmt(pointer_size: int) -> str:
